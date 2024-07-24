@@ -1,4 +1,3 @@
-import os
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 from multiprocessing import cpu_count
@@ -6,11 +5,18 @@ from multiprocessing import cpu_count
 import torch
 import torch.distributed as dist
 from datasets import Dataset, load_dataset
-from simple_parsing import field, parse
+from simple_parsing import field, parse, Serializable, list_field
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel
+from huggingface_hub import HfApi, HfFolder, Repository
+import os
+import gc
+import wandb
 
 from .data import chunk_and_tokenize
 from .trainer import SaeTrainer, TrainConfig
+import sys
+sys.path.append("/root/sae/")
+
 
 
 @dataclass
@@ -27,10 +33,10 @@ class RunConfig(TrainConfig):
     )
     """Path to the dataset to use for training."""
 
-    split: str = "train"
+    split: str = "train[:20%]"
     """Dataset split to use for training."""
 
-    ctx_len: int = 2048
+    ctx_len: int = 64
     """Context length to use for training."""
 
     hf_token: str | None = None
@@ -40,9 +46,18 @@ class RunConfig(TrainConfig):
     """Load the model in 8-bit mode."""
 
     data_preprocessing_num_proc: int = field(
-        default_factory=lambda: cpu_count() // 2,
+        default_factory=lambda: cpu_count() // 2
     )
     """Number of processes to use for preprocessing data"""
+
+    orthog_loss_coeff = 0.001
+    """Coefficient of the orthogonality loss term"""
+
+    log_to_wandb : bool = True
+    run_name : str = "orthog reg test"
+    batch_size : int = 16
+    layers = [8]
+
 
 
 def load_artifacts(args: RunConfig, rank: int) -> tuple[PreTrainedModel, Dataset]:
@@ -95,36 +110,68 @@ def load_artifacts(args: RunConfig, rank: int) -> tuple[PreTrainedModel, Dataset
 
 
 def run():
-    local_rank = os.environ.get("LOCAL_RANK")
-    ddp = local_rank is not None
-    rank = int(local_rank) if ddp else 0
+    for orthog_loss_coeff in [0.001, 0.01, 0.1, 1.0]:
+        for orthog_loss_type in ["random"]:
+        
+            local_rank = os.environ.get("LOCAL_RANK")
+            ddp = local_rank is not None
+            rank = int(local_rank) if ddp else 0
 
-    if ddp:
-        torch.cuda.set_device(int(local_rank))
-        dist.init_process_group("nccl")
+            if ddp:
+                torch.cuda.set_device(int(local_rank))
+                dist.init_process_group("nccl")
 
-        if rank == 0:
-            print(f"Using DDP across {dist.get_world_size()} GPUs.")
+                if rank == 0:
+                    print(f"Using DDP across {dist.get_world_size()} GPUs.")
 
-    args = parse(RunConfig)
+            # SET ARGS
+            args = parse(RunConfig)
+            args.layers = [8]
+            args.orthog_loss_coeff = orthog_loss_coeff
+            args.run_name = f"orthcoef={orthog_loss_coeff}_{orthog_loss_type}"
 
-    # Awkward hack to prevent other ranks from duplicating data preprocessing
-    if not ddp or rank == 0:
-        model, dataset = load_artifacts(args, rank)
-    if ddp:
-        dist.barrier()
-        if rank != 0:
-            model, dataset = load_artifacts(args, rank)
-        dataset = dataset.shard(dist.get_world_size(), rank)
+            # Awkward hack to prevent other ranks from duplicating data preprocessing
+            if not ddp or rank == 0:
+                model, dataset = load_artifacts(args, rank)
+            if ddp:
+                dist.barrier()
+                if rank != 0:
+                    model, dataset = load_artifacts(args, rank)
+                dataset = dataset.shard(dist.get_world_size(), rank)
 
-    # Prevent ranks other than 0 from printing
-    with nullcontext() if rank == 0 else redirect_stdout(None):
-        print(f"Training on '{args.dataset}' (split '{args.split}')")
-        print(f"Storing model weights in {model.dtype}")
+            # Prevent ranks other than 0 from printing
+            with nullcontext() if rank == 0 else redirect_stdout(None):
+                print(f"Training on '{args.dataset}' (split '{args.split}')")
+                print(f"Storing model weights in {model.dtype}")
 
-        trainer = SaeTrainer(args, dataset, model)
-        trainer.fit()
+                trainer = SaeTrainer(args, dataset, model)
+                trainer.fit()
+            wandb.finish()
 
+            # save trained model
+            api = HfApi()
+            cfg_path = f"/root/sae/{args.run_name}/layers.8/cfg.json"
+            sae_path = f"/root/sae/{args.run_name}/layers.8/sae.safetensors"
+
+            # Upload the files to a new repository
+            api.upload_file(
+                path_or_fileobj=cfg_path,
+                path_in_repo = f"{args.run_name}_cfg.json",
+                repo_id="jacobcd52/orthog-sae"
+            )
+
+            api.upload_file(
+                path_or_fileobj=sae_path,
+                path_in_repo = f"{args.run_name}.safetensors",
+                repo_id="jacobcd52/orthog-sae"
+            )
+            print("SAVED")
+
+            del trainer
+            gc.collect()
+            torch.cuda.empty_cache()
+        
+        
 
 if __name__ == "__main__":
     run()

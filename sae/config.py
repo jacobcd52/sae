@@ -9,7 +9,7 @@ class SaeConfig(Serializable):
     Configuration for training a sparse autoencoder on a language model.
     """
 
-    expansion_factor: int = 32
+    expansion_factor: int = 16 # TODO
     """Multiple of the input dimension to use as the SAE dimension."""
 
     normalize_decoder: bool = True
@@ -18,7 +18,7 @@ class SaeConfig(Serializable):
     num_latents: int = 0
     """Number of latents to use. If 0, use `expansion_factor`."""
 
-    k: int = 32
+    k: int = 64
     """Number of nonzero features."""
 
     signed: bool = False
@@ -45,6 +45,12 @@ class TrainConfig(Serializable):
     auxk_alpha: float = 0.0
     """Weight of the auxiliary loss term."""
 
+    orthog_loss_coeff : float = 0.0
+    """Coefficient of the orthog loss term"""
+
+    orthog_loss_type : str = "random"
+    """Either 'random' or 'active'"""
+
     dead_feature_threshold: int = 10_000_000
     """Number of tokens after which a feature is considered dead."""
 
@@ -60,8 +66,10 @@ class TrainConfig(Serializable):
     distribute_modules: bool = False
     """Store a single copy of each SAE, instead of copying them across devices."""
 
-    save_every: int = 1000
+    save_every: int = 5000
     """Save SAEs every `save_every` steps."""
+
+
 
     log_to_wandb: bool = True
     run_name: str | None = None

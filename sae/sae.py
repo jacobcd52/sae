@@ -1,3 +1,4 @@
+
 import json
 from fnmatch import fnmatch
 from pathlib import Path
@@ -5,13 +6,14 @@ from typing import NamedTuple
 
 import einops
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, hf_hub_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
+from einops import einsum
 
-from .config import SaeConfig
-from .utils import decoder_impl
+from .config import SaeConfig # JACOB: change .config to config
+from .utils import decoder_impl # JACOB: change .utils to utils
 
 
 class EncoderOutput(NamedTuple):
@@ -83,41 +85,45 @@ class Sae(nn.Module):
             f.stem: Sae.load_from_disk(f, device=device, decoder=decoder)
             for f in natsorted(files, key=lambda f: f.stem)
         }
-
+    
     @staticmethod
     def load_from_hub(
-        name: str,
+        repo_name: str,
+        filename : str,
         hookpoint: str | None = None,
         device: str | torch.device = "cpu",
         *,
         decoder: bool = True,
     ) -> "Sae":
-        # Download from the HuggingFace Hub
-        repo_path = Path(
-            snapshot_download(
-                name,
-                allow_patterns=f"{hookpoint}/*" if hookpoint is not None else None,
-            )
-        )
+        # Download specific files from the Hugging Face Hub
+        safetensors_filename = f"{filename}.safetensors"
+        cfg_filename = f"{filename}_cfg.json"
+        
+        safetensors_path = hf_hub_download(repo_id=repo_name, filename=safetensors_filename)
+        print(safetensors_path)
+        cfg_path = hf_hub_download(repo_id=repo_name, filename=cfg_filename)
+        
+        repo_path = Path(safetensors_path).parent
+
         if hookpoint is not None:
             repo_path = repo_path / hookpoint
 
-        # No layer specified, and there are multiple layers
-        elif not repo_path.joinpath("cfg.json").exists():
-            raise FileNotFoundError("No config file found; try specifying a layer.")
+        # Ensure both files are present
+        if not (repo_path / safetensors_filename).exists() or not (repo_path / cfg_filename).exists():
+            raise FileNotFoundError("Required files are missing; ensure both .safetensors and _cfg.json files are downloaded.")
 
-        return Sae.load_from_disk(repo_path, device=device, decoder=decoder)
+        return Sae.load_from_disk(safetensors_path, cfg_path, device=device, decoder=decoder)
 
     @staticmethod
     def load_from_disk(
-        path: Path | str,
+        safetensors_path: Path | str,
+        cfg_path: Path | str,
         device: str | torch.device = "cpu",
         *,
         decoder: bool = True,
     ) -> "Sae":
-        path = Path(path)
 
-        with open(path / "cfg.json", "r") as f:
+        with open(cfg_path, "r") as f:
             cfg_dict = json.load(f)
             d_in = cfg_dict.pop("d_in")
             cfg = SaeConfig(**cfg_dict)
@@ -125,7 +131,7 @@ class Sae(nn.Module):
         sae = Sae(d_in, cfg, device=device, decoder=decoder)
         load_model(
             model=sae,
-            filename=str(path / "sae.safetensors"),
+            filename=str(safetensors_path),
             device=str(device),
             # TODO: Maybe be more fine-grained about this in the future?
             strict=decoder,
@@ -218,12 +224,13 @@ class Sae(nn.Module):
         l2_loss = e.pow(2).sum(0)
         fvu = torch.mean(l2_loss / total_variance)
 
+
         return ForwardOutput(
             sae_out,
             top_acts,
             top_indices,
             fvu,
-            auxk_loss,
+            auxk_loss
         )
 
     @torch.no_grad()

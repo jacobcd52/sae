@@ -2,6 +2,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from typing import Sized
 
+from einops import einsum
 import torch
 import torch.distributed as dist
 from fnmatch import fnmatchcase
@@ -11,11 +12,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup
+from transformers import PreTrainedModel, PretrainedConfig
+from huggingface_hub import HfApi, HfFolder, Repository
 
 from .config import TrainConfig
 from .sae import Sae
 from .utils import geometric_median, get_layer_list, resolve_widths
-
 
 class SaeTrainer:
     def __init__(self, cfg: TrainConfig, dataset: Dataset, model: PreTrainedModel):
@@ -39,6 +41,7 @@ class SaeTrainer:
             # Now convert layers to hookpoints
             layers_name, _ = get_layer_list(model)
             cfg.hookpoints = [f"{layers_name}.{i}" for i in cfg.layers]
+            print("cfg.hookpoints", cfg.hookpoints)
 
         self.cfg = cfg
         self.dataset = dataset
@@ -105,7 +108,7 @@ class SaeTrainer:
 
                 wandb.init(
                     name=self.cfg.run_name,
-                    project="sae",
+                    project="topk sae",
                     config=asdict(self.cfg),
                     save_code=True,
                 )
@@ -141,6 +144,7 @@ class SaeTrainer:
         # For logging purposes
         avg_auxk_loss = defaultdict(float)
         avg_fvu = defaultdict(float)
+        avg_sim = defaultdict(float)
 
         hidden_dict: dict[str, Tensor] = {}
         name_to_module = {
@@ -236,6 +240,48 @@ class SaeTrainer:
                     did_fire[name][out.latent_indices.flatten()] = True
                     self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
+
+                ############## JACOB DANGER ZONE #################
+                # # Add orthog loss gradients by hand lol
+                # # Expand self.W_dec to include batch dimension
+                W_dec = raw.W_dec.to(self.model.dtype)
+                batch, k = out.latent_indices.shape
+                n_features, d_model = W_dec.shape
+
+                # Get cossims of some subset of features (either the active ones, or just randomly chosen)
+                if self.cfg.orthog_loss_type == "active":
+                    indices = out.latent_indices
+                elif self.cfg.orthog_loss_type == "random":
+                    indices = torch.randint(0, n_features, (batch, k), device=W_dec.device)
+                else:
+                    raise ValueError(f"Unknown orthog_loss_type: {self.cfg.orthog_loss_type}")
+                indices = indices.unsqueeze(-1).expand(-1, -1, d_model)  # Shape: [batch, k, d_model]
+
+                W_dec_normed = W_dec if raw.cfg.normalize_decoder  else W_dec / W_dec.norm(dim=-1, keepdim=True)
+                expanded_W_dec = W_dec_normed.unsqueeze(0).expand(batch, -1, -1)  # Shape: [batch, k, d_model]
+                active_W_dec = torch.gather(expanded_W_dec, 1, indices)  # Shape: [batch, k, d_model]
+                cossims = einsum(active_W_dec, active_W_dec, "b k1 d_model, b k2 d_model -> b k1 k2")
+                
+                # Manually compute grad of sum(cossims**2)
+                topk_grad_per_batch = 2*einsum(active_W_dec, cossims, "b k1 d_model, b k1 k2 -> b k2 d_model")
+                # log the mean squared cossims
+                triu_inds = torch.triu_indices(k, k, offset=1)
+                avg_sim[name] = float((cossims**2)[:, triu_inds[0], triu_inds[1]].mean().detach())
+                
+                # Initialize grad_per_batch with zeros
+                grad_per_batch = torch.zeros((batch, n_features, d_model), dtype=topk_grad_per_batch.dtype, device=topk_grad_per_batch.device)
+
+                # Create batch indices
+                batch_indices = torch.arange(batch).unsqueeze(1).expand(batch, k)
+
+                # Scatter grad values into grad_per_batch at the appropriate positions
+                grad_per_batch[batch_indices, out.latent_indices] = topk_grad_per_batch
+                grad = self.cfg.orthog_loss_coeff * grad_per_batch.mean(dim=0)  # Shape: [n_features, d_model]
+                    
+                raw.W_dec.grad.data += grad
+
+                #################################################
+
                 # Clip gradient norm independently for each SAE
                 torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)
 
@@ -284,9 +330,13 @@ class SaeTrainer:
                         )
                         if self.cfg.auxk_alpha > 0:
                             info[f"auxk/{name}"] = avg_auxk_loss[name]
+                        
+                        info[f"avg_sim/{name}"] = avg_sim[name]
+
 
                     avg_auxk_loss.clear()
                     avg_fvu.clear()
+                    avg_sim.clear()
 
                     if self.cfg.distribute_modules:
                         outputs = [{} for _ in range(dist.get_world_size())]
@@ -398,3 +448,7 @@ class SaeTrainer:
         # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()
+    
+    def upload_to_hf(self, path):
+        """Upload the SAEs from disk to HuggingFace. Must call self.save() first."""
+        
