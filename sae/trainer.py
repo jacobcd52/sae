@@ -72,7 +72,7 @@ class SaeTrainer:
             {
                 "params": sae.parameters(),
                 # Auto-select LR using 1 / sqrt(d) scaling law from Fig 3 of the paper
-                "lr": cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5
+                "lr": cfg.lr or 2e-4 / (sae.num_latents / (2**14)) ** 0.5 # JACOB
             }
             for sae in self.saes.values()
         ]
@@ -108,7 +108,7 @@ class SaeTrainer:
 
                 wandb.init(
                     name=self.cfg.run_name,
-                    project="topk sae",
+                    project="binary-sae",
                     config=asdict(self.cfg),
                     save_code=True,
                 )
@@ -158,7 +158,7 @@ class SaeTrainer:
                 outputs = outputs[0]
 
             name = module_to_name[module]
-            hidden_dict[name] = outputs.flatten(0, 1)
+            hidden_dict[name] = outputs[:, :].flatten(0, 1) # JACOB  should we ignore BOS activation?
 
         for i, batch in enumerate(pbar):
             hidden_dict.clear()
@@ -233,54 +233,38 @@ class SaeTrainer:
                             self.maybe_all_reduce(out.auxk_loss.detach()) / denom
                         )
 
-                    loss = out.fvu + self.cfg.auxk_alpha * out.auxk_loss
+                    loss = out.fvu + self.cfg.auxk_alpha * out.auxk_loss + self.cfg.binary_coeff * out.binary_loss
                     loss.div(acc_steps).backward()
 
                     # Update the did_fire mask
                     did_fire[name][out.latent_indices.flatten()] = True
                     self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
 
+                # Log the acts
+                if self.cfg.log_to_wandb and (i + 1) % self.cfg.wandb_log_frequency == 0:
+                    # import numpy as np
+                    # wandb.log({
+                    #     "histogram_name": wandb.Histogram( 
+                    #     np.minimum(4, out.latent_acts.flatten().detach().cpu().numpy()),
+                    #     num_bins=64
+                    #     )
+                    #     })
 
-                ############## JACOB DANGER ZONE #################
-                # # Add orthog loss gradients by hand lol
-                # # Expand self.W_dec to include batch dimension
-                W_dec = raw.W_dec.to(self.model.dtype)
-                batch, k = out.latent_indices.shape
-                n_features, d_model = W_dec.shape
+                    # Save memory by chunking the activations
+                    for chunk in hiddens.chunk(self.cfg.micro_acc_steps):
+                        out = wrapped(
+                            chunk,
+                            dead_mask=(
+                                num_tokens_since_fired[name]
+                                > self.cfg.dead_feature_threshold
+                                if self.cfg.auxk_alpha > 0
+                                else None
+                            ),
+                            heaviside = True
+                        )
+                        heaviside_fvu = out.fvu.detach().cpu()
+                        wandb.log({"heaviside_fvu": heaviside_fvu})
 
-                # Get cossims of some subset of features (either the active ones, or just randomly chosen)
-                if self.cfg.orthog_loss_type == "active":
-                    indices = out.latent_indices
-                elif self.cfg.orthog_loss_type == "random":
-                    indices = torch.randint(0, n_features, (batch, k), device=W_dec.device)
-                else:
-                    raise ValueError(f"Unknown orthog_loss_type: {self.cfg.orthog_loss_type}")
-                indices = indices.unsqueeze(-1).expand(-1, -1, d_model)  # Shape: [batch, k, d_model]
-
-                W_dec_normed = W_dec if raw.cfg.normalize_decoder  else W_dec / W_dec.norm(dim=-1, keepdim=True)
-                expanded_W_dec = W_dec_normed.unsqueeze(0).expand(batch, -1, -1)  # Shape: [batch, k, d_model]
-                active_W_dec = torch.gather(expanded_W_dec, 1, indices)  # Shape: [batch, k, d_model]
-                cossims = einsum(active_W_dec, active_W_dec, "b k1 d_model, b k2 d_model -> b k1 k2")
-                
-                # Manually compute grad of sum(cossims**2)
-                topk_grad_per_batch = 2*einsum(active_W_dec, cossims, "b k1 d_model, b k1 k2 -> b k2 d_model")
-                # log the mean squared cossims
-                triu_inds = torch.triu_indices(k, k, offset=1)
-                avg_sim[name] = float((cossims**2)[:, triu_inds[0], triu_inds[1]].mean().detach())
-                
-                # Initialize grad_per_batch with zeros
-                grad_per_batch = torch.zeros((batch, n_features, d_model), dtype=topk_grad_per_batch.dtype, device=topk_grad_per_batch.device)
-
-                # Create batch indices
-                batch_indices = torch.arange(batch).unsqueeze(1).expand(batch, k)
-
-                # Scatter grad values into grad_per_batch at the appropriate positions
-                grad_per_batch[batch_indices, out.latent_indices] = topk_grad_per_batch
-                grad = self.cfg.orthog_loss_coeff * grad_per_batch.mean(dim=0)  # Shape: [n_features, d_model]
-                    
-                raw.W_dec.grad.data += grad
-
-                #################################################
 
                 # Clip gradient norm independently for each SAE
                 torch.nn.utils.clip_grad_norm_(raw.parameters(), 1.0)

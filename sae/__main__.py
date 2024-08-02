@@ -33,10 +33,10 @@ class RunConfig(TrainConfig):
     )
     """Path to the dataset to use for training."""
 
-    split: str = "train[:20%]"
+    split: str = "train[:1%]"
     """Dataset split to use for training."""
 
-    ctx_len: int = 64
+    ctx_len: int = 128
     """Context length to use for training."""
 
     hf_token: str | None = None
@@ -50,12 +50,9 @@ class RunConfig(TrainConfig):
     )
     """Number of processes to use for preprocessing data"""
 
-    orthog_loss_coeff = 0.001
-    """Coefficient of the orthogonality loss term"""
-
     log_to_wandb : bool = True
-    run_name : str = "orthog reg test"
-    batch_size : int = 16
+    run_name : str = "test"
+    batch_size : int = 128
     layers = [8]
 
 
@@ -96,7 +93,7 @@ def load_artifacts(args: RunConfig, rank: int) -> tuple[PreTrainedModel, Dataset
 
     assert isinstance(dataset, Dataset)
     if "input_ids" not in dataset.column_names:
-        tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, token=args.hf_token, add_bos_token=True)
         dataset = chunk_and_tokenize(
             dataset,
             tokenizer,
@@ -110,66 +107,68 @@ def load_artifacts(args: RunConfig, rank: int) -> tuple[PreTrainedModel, Dataset
 
 
 def run():
-    for orthog_loss_coeff in [0.001, 0.01, 0.1, 1.0]:
-        for orthog_loss_type in ["random"]:
-        
-            local_rank = os.environ.get("LOCAL_RANK")
-            ddp = local_rank is not None
-            rank = int(local_rank) if ddp else 0
+    for k in [50, 60, 80, 100, 150, 200, 300]:
+        for binary_coeff in [0.001]: #[0.0, 0.001]:
+            for binary_sqrt in [False]:
+                local_rank = os.environ.get("LOCAL_RANK")
+                ddp = local_rank is not None
+                rank = int(local_rank) if ddp else 0
 
-            if ddp:
-                torch.cuda.set_device(int(local_rank))
-                dist.init_process_group("nccl")
+                if ddp:
+                    torch.cuda.set_device(int(local_rank))
+                    dist.init_process_group("nccl")
 
-                if rank == 0:
-                    print(f"Using DDP across {dist.get_world_size()} GPUs.")
+                    if rank == 0:
+                        print(f"Using DDP across {dist.get_world_size()} GPUs.")
 
-            # SET ARGS
-            args = parse(RunConfig)
-            args.layers = [8]
-            args.orthog_loss_coeff = orthog_loss_coeff
-            args.run_name = f"orthcoef={orthog_loss_coeff}_{orthog_loss_type}"
+                # SET ARGS
+                args = parse(RunConfig)
+                args.layers = [8]
+                args.binary_coeff = binary_coeff
+                args.sae.k = k
+                args.sae.binary_sqrt = binary_sqrt
+                args.run_name = f"binary_coeff={binary_coeff}_sqrt={binary_sqrt}_k={args.sae.k}"
 
-            # Awkward hack to prevent other ranks from duplicating data preprocessing
-            if not ddp or rank == 0:
-                model, dataset = load_artifacts(args, rank)
-            if ddp:
-                dist.barrier()
-                if rank != 0:
+                # Awkward hack to prevent other ranks from duplicating data preprocessing
+                if not ddp or rank == 0:
                     model, dataset = load_artifacts(args, rank)
-                dataset = dataset.shard(dist.get_world_size(), rank)
+                if ddp:
+                    dist.barrier()
+                    if rank != 0:
+                        model, dataset = load_artifacts(args, rank)
+                    dataset = dataset.shard(dist.get_world_size(), rank)
 
-            # Prevent ranks other than 0 from printing
-            with nullcontext() if rank == 0 else redirect_stdout(None):
-                print(f"Training on '{args.dataset}' (split '{args.split}')")
-                print(f"Storing model weights in {model.dtype}")
+                # Prevent ranks other than 0 from printing
+                with nullcontext() if rank == 0 else redirect_stdout(None):
+                    print(f"Training on '{args.dataset}' (split '{args.split}')")
+                    print(f"Storing model weights in {model.dtype}")
 
-                trainer = SaeTrainer(args, dataset, model)
-                trainer.fit()
-            wandb.finish()
+                    trainer = SaeTrainer(args, dataset, model)
+                    trainer.fit()
+                wandb.finish()
 
-            # save trained model
-            api = HfApi()
-            cfg_path = f"/root/sae/{args.run_name}/layers.8/cfg.json"
-            sae_path = f"/root/sae/{args.run_name}/layers.8/sae.safetensors"
+                # save trained model
+                api = HfApi()
+                cfg_path = f"/root/sae/{args.run_name}/layers.8/cfg.json"
+                sae_path = f"/root/sae/{args.run_name}/layers.8/sae.safetensors"
 
-            # Upload the files to a new repository
-            api.upload_file(
-                path_or_fileobj=cfg_path,
-                path_in_repo = f"{args.run_name}_cfg.json",
-                repo_id="jacobcd52/orthog-sae"
-            )
+                # Upload the files to a new repository
+                api.upload_file(
+                    path_or_fileobj=cfg_path,
+                    path_in_repo = f"{args.run_name}_cfg.json",
+                    repo_id="jacobcd52/binary-sae"
+                )
 
-            api.upload_file(
-                path_or_fileobj=sae_path,
-                path_in_repo = f"{args.run_name}.safetensors",
-                repo_id="jacobcd52/orthog-sae"
-            )
-            print("SAVED")
+                api.upload_file(
+                    path_or_fileobj=sae_path,
+                    path_in_repo = f"{args.run_name}.safetensors",
+                    repo_id="jacobcd52/binary-sae"
+                )
+                print("SAVED")
 
-            del trainer
-            gc.collect()
-            torch.cuda.empty_cache()
+                del trainer
+                gc.collect()
+                torch.cuda.empty_cache()
         
         
 

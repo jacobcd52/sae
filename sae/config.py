@@ -9,10 +9,10 @@ class SaeConfig(Serializable):
     Configuration for training a sparse autoencoder on a language model.
     """
 
-    expansion_factor: int = 16 # TODO
+    expansion_factor: int = 32
     """Multiple of the input dimension to use as the SAE dimension."""
 
-    normalize_decoder: bool = True
+    normalize_decoder: bool = False
     """Normalize the decoder weights to have unit norm."""
 
     num_latents: int = 0
@@ -23,12 +23,18 @@ class SaeConfig(Serializable):
 
     signed: bool = False
 
+    binary_sqrt : bool = False
+    """TODO"""
+
 
 @dataclass
 class TrainConfig(Serializable):
     sae: SaeConfig
 
-    batch_size: int = 8
+    binary_coeff: float = 0.0001
+    """TODO"""
+
+    batch_size: int = 16
     """Batch size measured in sequences."""
 
     grad_acc_steps: int = 1
@@ -42,14 +48,8 @@ class TrainConfig(Serializable):
 
     lr_warmup_steps: int = 1000
 
-    auxk_alpha: float = 0.0
+    auxk_alpha: float = 0.0 #
     """Weight of the auxiliary loss term."""
-
-    orthog_loss_coeff : float = 0.0
-    """Coefficient of the orthog loss term"""
-
-    orthog_loss_type : str = "random"
-    """Either 'random' or 'active'"""
 
     dead_feature_threshold: int = 10_000_000
     """Number of tokens after which a feature is considered dead."""
@@ -73,7 +73,7 @@ class TrainConfig(Serializable):
 
     log_to_wandb: bool = True
     run_name: str | None = None
-    wandb_log_frequency: int = 1
+    wandb_log_frequency: int = 30
 
     def __post_init__(self):
         assert not (

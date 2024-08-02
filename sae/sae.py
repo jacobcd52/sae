@@ -39,6 +39,9 @@ class ForwardOutput(NamedTuple):
     auxk_loss: Tensor
     """AuxK loss, if applicable."""
 
+    binary_loss : Tensor
+    """Binary loss, if applicable."""
+
 
 class Sae(nn.Module):
     def __init__(
@@ -167,36 +170,42 @@ class Sae(nn.Module):
 
         return nn.functional.relu(out) if not self.cfg.signed else out
 
-    def select_topk(self, latents: Tensor) -> EncoderOutput:
+    def select_topk(self, latents: Tensor, heaviside=False) -> EncoderOutput:
         """Select the top-k latents."""
+        import plotly.express as px
         if self.cfg.signed:
             _, top_indices = latents.abs().topk(self.cfg.k, sorted=False)
             top_acts = latents.gather(dim=-1, index=top_indices)
-
-            return EncoderOutput(top_acts, top_indices)
-
-        return EncoderOutput(*latents.topk(self.cfg.k, sorted=False))
+        else:
+            top_acts, top_indices = latents.topk(self.cfg.k, sorted=False)
+        if heaviside:
+            top_acts = torch.heaviside(top_acts, torch.tensor(0.2)) # Note is this right?
+        return EncoderOutput(top_acts, top_indices)
 
     def encode(self, x: Tensor) -> EncoderOutput:
-        """Encode the input and select the top-k latents."""
+        """Encode the input and select the top-k latents."""           
         return self.select_topk(self.pre_acts(x))
 
     def decode(self, top_acts: Tensor, top_indices: Tensor) -> Tensor:
-        assert self.W_dec is not None, "Decoder weight was not initialized."
-
+        # assert self.W_dec is not None, "Decoder weight was not initialized."
         y = decoder_impl(top_indices, top_acts.to(self.dtype), self.W_dec.mT)
         return y + self.b_dec
 
-    def forward(self, x: Tensor, dead_mask: Tensor | None = None) -> ForwardOutput:
+    def forward(self, x: Tensor, dead_mask: Tensor | None = None, heaviside=False) -> ForwardOutput:
         pre_acts = self.pre_acts(x)
-        top_acts, top_indices = self.select_topk(pre_acts)
+        top_acts, top_indices = self.select_topk(pre_acts, heaviside=heaviside)
 
         # Decode and compute residual
         sae_out = self.decode(top_acts, top_indices)
         e = sae_out - x
 
+        if self.cfg.binary_sqrt:
+            binary_loss = ((top_acts - 1).pow(2) * (top_acts).pow(2) + 1e-6).sqrt().sum(dim=-1).mean()
+        else:
+            binary_loss = ((top_acts - 1).pow(2) * (top_acts).pow(2)).sum(dim=-1).mean()
+
         # Used as a denominator for putting everything on a reasonable scale
-        total_variance = (x - x.mean(0)).pow(2).sum(0)
+        total_variance = (x - x.mean(0)).pow(2).sum(0) 
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
@@ -221,16 +230,16 @@ class Sae(nn.Module):
         else:
             auxk_loss = sae_out.new_tensor(0.0)
 
-        l2_loss = e.pow(2).sum(0)
+        l2_loss = e.pow(2).sum(0) 
         fvu = torch.mean(l2_loss / total_variance)
-
 
         return ForwardOutput(
             sae_out,
             top_acts,
             top_indices,
             fvu,
-            auxk_loss
+            auxk_loss,
+            binary_loss
         )
 
     @torch.no_grad()
