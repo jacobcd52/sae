@@ -12,8 +12,8 @@ from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 from einops import einsum
 
-from .config import SaeConfig # JACOB: change .config to config
-from .utils import decoder_impl # JACOB: change .utils to utils
+from config import SaeConfig # JACOB: change .config to config
+from utils import decoder_impl # JACOB: change .utils to utils
 
 
 class EncoderOutput(NamedTuple):
@@ -205,7 +205,7 @@ class Sae(nn.Module):
             binary_loss = ((top_acts - 1).pow(2) * (top_acts).pow(2)).sum(dim=-1).mean()
 
         # Used as a denominator for putting everything on a reasonable scale
-        total_variance = (x - x.mean(0)).pow(2).sum(0) 
+        total_variance = (x - x.mean(0)).pow(2).sum(0).sum(dim=-1) 
 
         # Second decoder pass for AuxK loss
         if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
@@ -230,7 +230,7 @@ class Sae(nn.Module):
         else:
             auxk_loss = sae_out.new_tensor(0.0)
 
-        l2_loss = e.pow(2).sum(0) 
+        l2_loss = e.pow(2).sum(0).sum(dim=-1)  
         fvu = torch.mean(l2_loss / total_variance)
 
         return ForwardOutput(
